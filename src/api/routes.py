@@ -1,6 +1,7 @@
 """API routes for OpenAI-compatible and Gemini generateContent endpoints."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import base64
 import json
@@ -15,12 +16,14 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Security,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.auth import AuthManager, verify_api_key_flexible, verify_api_key_header
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -37,6 +40,15 @@ router = APIRouter()
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
 HTML_VIDEO_RE = re.compile(r"<video[^>]+src=['\"](.*?)['\"]", re.IGNORECASE)
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+CACHE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# flow-content.google 是本服务实际写进 fifeUrl 的主机（flow_frontend 的直链，以及
+# tests/test_video_asset_resolution.py）。另外两个是 Google 媒体常见主机。
+MEDIA_PROXY_HOST_SUFFIXES = (
+    "flow-content.google",
+    "googleusercontent.com",
+    "storage.googleapis.com",
+)
+_media_bearer = HTTPBearer(auto_error=False)
 MEDIA_PROMPT_TOOL_BLOCK_RE = re.compile(
     r"<tools>.*?</tools>", re.IGNORECASE | re.DOTALL
 )
@@ -877,6 +889,136 @@ async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_fle
         )
 
     return _build_gemini_model_resource(model, description)
+
+
+def _media_error(status_code: int, message: str, code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": "server_error" if status_code >= 500 else "invalid_request_error",
+                "code": code,
+                "status_code": status_code,
+            }
+        },
+    )
+
+
+def _unsupported_media() -> JSONResponse:
+    return _media_error(400, "不支持的媒体地址", "unsupported_media_url")
+
+
+async def verify_media_bearer(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_media_bearer),
+) -> str:
+    """Bearer only. HTTPBearer answers a missing header with 403; this route uses 401."""
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return await verify_api_key_header(credentials)
+
+
+def _safe_cache_name(name: str) -> bool:
+    return bool(CACHE_NAME_RE.fullmatch(name)) and name not in {".", ".."} and ".." not in name
+
+
+def _cache_filename(url: str) -> Optional[str]:
+    """Return the cache filename when the URL path is exactly /tmp/<name>."""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    segments = [part for part in parsed.path.split("/") if part]
+    if len(segments) != 2 or segments[0] != "tmp":
+        return None
+    name = segments[1]
+    if not _safe_cache_name(name):
+        return None
+    return name
+
+
+def _host_allowed(host: str) -> bool:
+    normalized = host.lower().rstrip(".")
+    return any(
+        normalized == suffix or normalized.endswith("." + suffix)
+        for suffix in MEDIA_PROXY_HOST_SUFFIXES
+    )
+
+
+def _proxy_media_type(parsed) -> Optional[str]:
+    path = (parsed.path or "").lower()
+    suffix = Path(path).suffix
+    if "/video/" in path or suffix in {".mp4", ".mov", ".webm", ".mkv", ".m4v"}:
+        return "video"
+    if "/image/" in path or suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp"}:
+        return "image"
+    return None
+
+
+def _file_cache_or_error():
+    file_cache = getattr(generation_handler, "file_cache", None)
+    if generation_handler is None or file_cache is None:
+        return None, _media_error(500, "生成服务未初始化", "media_unavailable")
+    return file_cache, None
+
+
+def _serve_cache_file(file_cache, name: str, *, missing: JSONResponse):
+    root = Path(file_cache.cache_dir).resolve()
+    candidate = (root / name).resolve()
+    if candidate.parent != root:
+        return _unsupported_media()
+    if not candidate.is_file():
+        return missing
+    guessed, _ = mimetypes.guess_type(candidate.name)
+    return FileResponse(candidate, media_type=guessed or "application/octet-stream")
+
+
+@router.get("/v1/media")
+async def proxy_media(
+    url: str = Query(""),
+    _api_key: str = Depends(verify_media_bearer),
+):
+    """Serve a cached file, or download an allowlisted Google media URL server-side."""
+    raw = url.strip()
+    if not raw:
+        return _unsupported_media()
+
+    file_cache, unavailable = _file_cache_or_error()
+    if unavailable is not None:
+        return unavailable
+
+    try:
+        local_name = _cache_filename(raw)
+    except ValueError:
+        return _unsupported_media()
+    if local_name is not None:
+        return _serve_cache_file(
+            file_cache,
+            local_name,
+            missing=_media_error(404, "缓存文件不存在", "media_not_found"),
+        )
+
+    try:
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+    except ValueError:
+        return _unsupported_media()
+    media_type = _proxy_media_type(parsed) if parsed.scheme == "https" and _host_allowed(host) else None
+    if not media_type:
+        return _unsupported_media()
+
+    try:
+        filename = await file_cache.download_and_cache(raw, media_type)
+    except Exception as exc:
+        reason = str(exc).strip() or exc.__class__.__name__
+        return _media_error(502, f"下载媒体失败: {reason}", "media_download_failed")
+
+    if not isinstance(filename, str) or not _safe_cache_name(filename):
+        return _media_error(502, "下载媒体失败: 缓存文件名无效", "media_download_failed")
+    return _serve_cache_file(
+        file_cache,
+        filename,
+        missing=_media_error(502, "下载媒体失败: 缓存文件不存在", "media_download_failed"),
+    )
 
 
 @router.post("/v1/chat/completions")
