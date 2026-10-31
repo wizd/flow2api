@@ -5218,10 +5218,19 @@ class _FlowClientBase(FlowFrontendMixin):
 
                 service = await ExtensionCaptchaService.get_instance(self.db)
                 extension_timeout = 45 if action == "VIDEO_GENERATION" else 25
-                token = await service.get_token(
+                token, client_info = await service.get_token_with_client_info(
                     project_id, action, timeout=extension_timeout, token_id=token_id
                 )
-                self._set_request_fingerprint(None)
+                # 提交请求必须沿用扩展所在浏览器的 UA/Client Hints，
+                # 否则 Flow 会以 PUBLIC_ERROR_UNUSUAL_ACTIVITY 拒绝。
+                fingerprint = self._build_fingerprint_from_user_agent(
+                    client_info.get("user_agent"),
+                    accept_language=client_info.get("accept_language"),
+                )
+                for key in ("sec_ch_ua", "sec_ch_ua_mobile", "sec_ch_ua_platform"):
+                    if fingerprint and client_info.get(key):
+                        fingerprint[key] = client_info[key]
+                self._set_request_fingerprint(fingerprint or None)
                 return token, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")

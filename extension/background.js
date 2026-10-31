@@ -142,7 +142,7 @@ async function handleGetToken(data) {
     let newTabId = null;
     try {
         console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
-        const newTab = await chrome.tabs.create({ url: "https://labs.google/fx/tools/flow", active: false });
+        const newTab = await chrome.tabs.create({ url: "https://flow.google.com/", active: false });
         newTabId = newTab.id;
 
         await waitForTabReady(newTabId);
@@ -168,7 +168,21 @@ async function handleGetToken(data) {
                             function run() {
                                 grecaptcha.enterprise.ready(function() {
                                     grecaptcha.enterprise.execute("6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV", { action: action })
-                                        .then(token => finish(resolve, token))
+                                        .then(token => {
+                                            // Google rejects the submit as UNUSUAL_ACTIVITY when its
+                                            // client fingerprint differs from the one that solved.
+                                            const uaData = navigator.userAgentData;
+                                            finish(resolve, {
+                                                token: token,
+                                                userAgent: navigator.userAgent,
+                                                acceptLanguage: (navigator.languages || []).join(","),
+                                                secChUa: uaData && uaData.brands
+                                                    ? uaData.brands.map(b => `"${b.brand}";v="${b.version}"`).join(", ")
+                                                    : "",
+                                                secChUaMobile: uaData ? (uaData.mobile ? "?1" : "?0") : "",
+                                                secChUaPlatform: uaData && uaData.platform ? `"${uaData.platform}"` : ""
+                                            });
+                                        })
                                         .catch(err => finish(reject, err.message || "reCAPTCHA evaluation failed internally"));
                                 });
                             }
@@ -192,8 +206,9 @@ async function handleGetToken(data) {
                 args: [data.action || "IMAGE_GENERATION", scriptTimeoutMs]
             });
 
-            if (results && results[0] && results[0].result) {
-                successResponse = { status: "success", token: results[0].result };
+            const result = results && results[0] && results[0].result;
+            if (result && result.token) {
+                successResponse = { status: "success", ...result };
             }
         } catch (e) {
             lastErrorMsg = e.message || "Script execution failed";
@@ -203,7 +218,12 @@ async function handleGetToken(data) {
             ws.send(JSON.stringify({
                 req_id: data.req_id,
                 status: successResponse.status,
-                token: successResponse.token
+                token: successResponse.token,
+                user_agent: successResponse.userAgent,
+                accept_language: successResponse.acceptLanguage,
+                sec_ch_ua: successResponse.secChUa,
+                sec_ch_ua_mobile: successResponse.secChUaMobile,
+                sec_ch_ua_platform: successResponse.secChUaPlatform
             }));
         } else {
             ws.send(JSON.stringify({

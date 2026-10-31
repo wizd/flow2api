@@ -170,6 +170,23 @@ class ExtensionCaptchaService:
         timeout: int = 20,
         token_id: Optional[int] = None,
     ) -> Optional[str]:
+        token, _ = await self.get_token_with_client_info(
+            project_id, action, timeout=timeout, token_id=token_id
+        )
+        return token
+
+    async def get_token_with_client_info(
+        self,
+        project_id: str,
+        action: str = "IMAGE_GENERATION",
+        timeout: int = 20,
+        token_id: Optional[int] = None,
+    ) -> tuple[Optional[str], dict]:
+        """Return the token plus the solving browser's UA / client hints.
+
+        Flow rejects a submit as UNUSUAL_ACTIVITY when its fingerprint differs
+        from the browser that produced the token, so callers should reuse it.
+        """
         if not self.active_connections:
             debug_logger.log_warning(
                 "[Extension Captcha] No active extension connections available."
@@ -208,22 +225,33 @@ class ExtensionCaptchaService:
             result = await asyncio.wait_for(future, timeout=timeout)
 
             if result.get("status") == "success":
-                return result.get("token")
+                client_info = {
+                    key: str(result.get(key) or "").strip()
+                    for key in (
+                        "user_agent",
+                        "accept_language",
+                        "sec_ch_ua",
+                        "sec_ch_ua_mobile",
+                        "sec_ch_ua_platform",
+                    )
+                    if str(result.get(key) or "").strip()
+                }
+                return result.get("token"), client_info
 
             error_msg = result.get("error")
             debug_logger.log_error(
                 f"[Extension Captcha] Error from extension: {error_msg}"
             )
-            return None
+            return None, {}
 
         except asyncio.TimeoutError:
             debug_logger.log_error(
                 f"[Extension Captcha] Timeout waiting for token (req_id: {req_id})"
             )
-            return None
+            return None, {}
         except Exception as e:
             debug_logger.log_error(f"[Extension Captcha] Communication error: {e}")
-            return None
+            return None, {}
         finally:
             self.pending_requests.pop(req_id, None)
 
