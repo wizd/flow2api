@@ -344,7 +344,36 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
                 config._config["flow"]["max_retries"] = previous_retries
         self.assertEqual(self.client._call_flow_frontend_rpc.await_count, 2)
 
-    async def test_access_denied_does_not_fallback_to_standard_key(self):
+    async def test_relaxed_access_denied_falls_back_to_standard_key(self):
+        operation_id = "11111111-1111-1111-1111-111111111111"
+        project_id = "22222222-2222-2222-2222-222222222222"
+        media_id = "33333333-3333-3333-3333-333333333333"
+        self.client._call_flow_frontend_rpc = AsyncMock(
+            side_effect=[
+                RuntimeError(
+                    "Flow frontend RPC rejected: rpc=nprQif, "
+                    "error=PUBLIC_ERROR_MODEL_ACCESS_DENIED"
+                ),
+                [[operation_id, project_id, media_id]],
+            ]
+        )
+
+        await self.client.generate_video_text(
+            at="at-token",
+            project_id=project_id,
+            prompt="猫猫",
+            model_key="veo_3_1_t2v_fast_6s_relaxed",
+            aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+            use_v2_model_config=True,
+            google_cookies="SID=session-cookie",
+        )
+
+        calls = self.client._call_flow_frontend_rpc.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].kwargs["argument"][0][0][1], "veo_3_1_t2v_fast_6s_relaxed")
+        self.assertEqual(calls[1].kwargs["argument"][0][0][1], "veo_3_1_t2v_fast_6s")
+
+    async def test_access_denied_on_standard_key_is_not_retried(self):
         self.client._call_flow_frontend_rpc = AsyncMock(
             side_effect=RuntimeError("PUBLIC_ERROR_MODEL_ACCESS_DENIED")
         )
@@ -359,7 +388,85 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
                 use_v2_model_config=True,
                 google_cookies="SID=session-cookie",
             )
+        calls = self.client._call_flow_frontend_rpc.await_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].kwargs["argument"][0][0][1], "veo_3_1_t2v_fast_6s")
+
+    async def test_access_denied_without_relaxed_key_is_not_retried(self):
+        self.client._call_flow_frontend_rpc = AsyncMock(
+            side_effect=RuntimeError("PUBLIC_ERROR_MODEL_ACCESS_DENIED")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ACCESS_DENIED"):
+            await self.client.generate_video_text(
+                at="at-token",
+                project_id="22222222-2222-2222-2222-222222222222",
+                prompt="猫猫",
+                model_key="veo_3_1_t2v_fast_6s",
+                aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+                use_v2_model_config=True,
+                google_cookies="SID=session-cookie",
+            )
         self.client._call_flow_frontend_rpc.assert_awaited_once()
+
+    async def test_denied_short_fast_i2v_falls_back_to_legacy_key_and_remembers(self):
+        operation_id = "11111111-1111-1111-1111-111111111111"
+        project_id = "22222222-2222-2222-2222-222222222222"
+        media_id = "33333333-3333-3333-3333-333333333333"
+        denied = RuntimeError(
+            "Flow frontend RPC rejected: rpc=eb1hJf, error=PUBLIC_ERROR_MODEL_ACCESS_DENIED"
+        )
+        self.client._call_flow_frontend_rpc = AsyncMock(
+            side_effect=[
+                denied,
+                denied,
+                [[operation_id, project_id, media_id]],
+                [[operation_id, project_id, media_id]],
+            ]
+        )
+        for _ in range(2):
+            await self.client.generate_video_start_image(
+                at="at-token",
+                project_id=project_id,
+                prompt="猫猫",
+                model_key="veo_3_1_i2v_s_fast_4s_relaxed",
+                aspect_ratio="VIDEO_ASPECT_RATIO_PORTRAIT",
+                start_media_id=media_id,
+                token_id=7,
+                google_cookies="SID=session-cookie",
+            )
+
+        keys = [
+            call.kwargs["argument"][0][0][1]
+            for call in self.client._call_flow_frontend_rpc.await_args_list
+        ]
+        self.assertEqual(
+            keys,
+            [
+                "veo_3_1_i2v_s_fast_4s_relaxed",
+                "veo_3_1_i2v_s_fast_4s",
+                "veo_3_1_i2v_s_fast_portrait",
+                "veo_3_1_i2v_s_fast_portrait",
+            ],
+        )
+
+    def test_short_fast_i2v_candidates_end_with_legacy_key(self):
+        self.assertEqual(
+            self.client._video_model_key_candidates(
+                "veo_3_1_i2v_s_fast_6s_fl_relaxed", "VIDEO_ASPECT_RATIO_LANDSCAPE"
+            ),
+            [
+                "veo_3_1_i2v_s_fast_6s_fl_relaxed",
+                "veo_3_1_i2v_s_fast_6s_fl",
+                "veo_3_1_i2v_s_fast_fl",
+            ],
+        )
+        self.assertEqual(
+            self.client._video_model_key_candidates(
+                "veo_3_1_i2v_s_lite_4s_fl", "VIDEO_ASPECT_RATIO_LANDSCAPE"
+            ),
+            ["veo_3_1_i2v_s_lite_4s_fl"],
+        )
 
     async def test_transient_retry_keeps_original_model_key(self):
         operation_id = "11111111-1111-1111-1111-111111111111"

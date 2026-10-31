@@ -521,6 +521,30 @@ class CurrentFlowClientMixin:
         finally:
             await self._notify_browser_captcha_request_finished(browser_id)
 
+    @staticmethod
+    def _video_model_key_candidates(model_key: str, aspect_ratio: str) -> List[str]:
+        """Model keys to try in order for one video request.
+
+        Relaxed keys fall back to the standard key of the same duration. Pro
+        accounts are denied the 4s/6s Fast I2V keys entirely, so those finally
+        fall back to the legacy Fast I2V key, which only produces 8s clips.
+        """
+        candidates = [str(model_key or "").strip()]
+        if "_relaxed" in candidates[0]:
+            candidates.append(candidates[0].replace("_relaxed", ""))
+        match = re.fullmatch(r"veo_3_1_i2v_s_fast_\d+s(_fl)?(?:_relaxed)?", candidates[0])
+        if match:
+            orientation = "_portrait" if aspect_ratio == "VIDEO_ASPECT_RATIO_PORTRAIT" else ""
+            candidates.append(f"veo_3_1_i2v_s_fast{orientation}{match.group(1) or ''}")
+        return candidates
+
+    def _denied_video_model_keys_for(self, token_id: Optional[int]) -> set:
+        denied = getattr(self, "_denied_video_model_keys", None)
+        if denied is None:
+            denied = {}
+            self._denied_video_model_keys = denied
+        return denied.setdefault(token_id, set())
+
     async def _current_generate_video(
         self,
         *,
@@ -540,18 +564,17 @@ class CurrentFlowClientMixin:
     ) -> dict:
         await self._frontend_cookie(google_cookies, token_id)
         max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
-        model_keys = [str(model_key or "").strip()]
-        # Flow currently exposes both relaxed and standard short-duration keys.
-        # Some Pro accounts return code=[5] for the relaxed key; retry the exact
-        # same duration/mode without the suffix before repeating the same request.
-        if "_relaxed" in model_keys[0]:
-            model_keys.append(model_keys[0].replace("_relaxed", ""))
-        attempt_budget = max(max_retries, len(model_keys))
-        fallback_model_key: Optional[str] = None
+        model_keys = self._video_model_key_candidates(model_key, aspect_ratio)
+        denied_keys = self._denied_video_model_keys_for(token_id)
+        # 跳过该账号已被拒绝过的 key，避免每次都多花一次打码；至少保留最后一个。
+        while len(model_keys) > 1 and model_keys[0] in denied_keys:
+            model_keys.pop(0)
+        attempt_budget = max_retries + len(model_keys) - 1
+        key_index = 0
         last_error: Optional[Exception] = None
         for retry_attempt in range(attempt_budget):
             browser_id = None
-            request_model_key = fallback_model_key or model_keys[0]
+            request_model_key = model_keys[key_index]
             try:
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
@@ -594,20 +617,23 @@ class CurrentFlowClientMixin:
                 )
             except Exception as error:
                 last_error = error
-                # MODEL_ACCESS_DENIED 为账号权限拒绝，重试不会改变结果
-                if "MODEL_ACCESS_DENIED" in str(error):
-                    raise
+                # MODEL_ACCESS_DENIED 为账号权限拒绝，code=[5] 为 key 不存在：
+                # 依次回退候选 key；最后一个仍被拒绝则不再重试。
+                is_access_denied = "MODEL_ACCESS_DENIED" in str(error)
                 error_text = str(error).lower()
                 is_missing_model = bool(
                     re.search(r"code\s*=\s*\[?5\]?", error_text)
                     or "not_found" in error_text
                     or "not found" in error_text
                 )
-                if is_missing_model and request_model_key != model_keys[-1]:
-                    fallback_model_key = model_keys[-1]
+                if is_access_denied or is_missing_model:
+                    if key_index >= len(model_keys) - 1:
+                        raise
+                    denied_keys.add(request_model_key)
+                    key_index += 1
                     debug_logger.log_warning(
-                        "[VIDEO] Flow 未找到 relaxed 模型 key，回退同一时长标准 key: "
-                        f"{request_model_key} -> {model_keys[-1]}"
+                        "[VIDEO] Flow 拒绝模型 key，回退下一个候选 key: "
+                        f"{request_model_key} -> {model_keys[key_index]}"
                     )
                     continue
                 if retry_attempt >= max_retries - 1:
